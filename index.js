@@ -1,120 +1,194 @@
-const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
 
-const BOUNDS_BELARUS = { north: 56.2, south: 51.2, west: 23.2, east: 32.8 };
-const BOUNDS_MINSK = {
-  north: 54.025,   // северная широта
-  south: 53.800,   // южная широта
-  west: 27.35,     // западная долгота
-  east: 27.75      // восточная долгота
+// Логирование в файл
+const logToFile = (message, logFile = 'download.log') => {
+  fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${message}\n`);
 };
 
-class TileProvider {
-  constructor (baseUrl, options) {
-    this.baseUrl = baseUrl;
-    this.options = options;
-  }
-
-  getTileUrl(x, y, z) {
-    let url = this.baseUrl;
-    url = url.replace('{x}', x).replace('{y}', y).replace('{z}', z);
-    Object.keys(this.options).forEach(key => {
-      url = url.replace(`{${key}}`, this.options[key]);
-    });
-    return url;
-  }
-}
-
+// Tile provider factory
 class TileProviderFactory {
-  static create(providerName) {
+  static create(providerName, lang = null) {
     switch (providerName) {
       case 'google':
-        return new TileProvider('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {});
+        return new GoogleTileProvider(lang);
       case 'yandex':
-        return new TileProvider('https://core-renderer-tiles.maps.yandex.net/tiles?l=map&v=21.07.10-0&x={x}&y={y}&z={z}&scale=1&lang=ru_RU', {});
+        return new YandexTileProvider(lang);
+      case 'osm': // OpenStreetMap
+        return new OpenStreetMapTileProvider();
+      case 'bing': // Bing Maps
+        return new BingTileProvider();
       default:
         throw new Error(`Provider "${providerName}" is not supported`);
     }
   }
 }
 
-// Преобразование широты и долготы в координаты тайла
-function latLonToTile(lat, lon, zoom) {
-  const xTile = Math.floor((lon + 180) / 360 * Math.pow(2, zoom));
-  const yTile = Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom));
-  return { x: xTile, y: yTile };
-}
+// Google Maps provider
+class GoogleTileProvider {
+  constructor (lang) {
+    this.name = 'google';
+    this.langParam = lang ? `&hl=${lang}` : '';
+  }
 
-// Сохранение неудачной попытки загрузки в лог
-function logFailedTile(x, y, z, provider) {
-  const logEntry = `${provider},${z},${x},${y}\n`;
-  fs.appendFileSync('failed_tiles.log', logEntry);
-  console.log(`Logged failed tile: Provider=${provider}, Zoom=${z}, x=${x}, y=${y}`);
-}
-
-// Сохранение тайла на диске
-async function saveTile(url, x, y, z, provider) {
-  try {
-    const response = await axios.get(url, { responseType: 'arraybuffer' });
-    const dir = path.join(__dirname, 'tiles', provider, `${z}`, `${x}`);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, `${y}.png`), response.data);
-    console.log(`Tile saved: Provider=${provider}, Zoom=${z}, x=${x}, y=${y}`);
-  } catch (error) {
-    console.error(`Failed to download tile: Provider=${provider}, Zoom=${z}, x=${x}, y=${y}`);
-    logFailedTile(x, y, z, provider);
+  getTileUrl(x, y, z) {
+    return `https://mt.google.com/vt/lyrs=y&x=${x}&y=${y}&z=${z}${this.langParam}`;
   }
 }
 
-// Основная функция для скачивания тайлов для заданного провайдера и границ
-async function downloadTiles(minZoom, maxZoom, providerName, bounds) {
-  const provider = TileProviderFactory.create(providerName);
+// Yandex Maps provider
+class YandexTileProvider {
+  constructor (lang) {
+    this.name = 'yandex';
+    this.langParam = lang ? `&lang=${lang}` : '';
+  }
 
-  for (let zoom = minZoom; zoom <= maxZoom; zoom++) {
-    const { x: xMin, y: yMin } = latLonToTile(bounds.north, bounds.west, zoom);
-    const { x: xMax, y: yMax } = latLonToTile(bounds.south, bounds.east, zoom);
-
-    for (let x = xMin; x <= xMax; x++) {
-      for (let y = yMin; y <= yMax; y++) {
-        const tileUrl = provider.getTileUrl(x, y, zoom);
-        await saveTile(tileUrl, x, y, zoom, providerName);
-      }
-    }
+  getTileUrl(x, y, z) {
+    return `https://core-renderer-tiles.maps.yandex.net/tiles?l=sat&x=${x}&y=${y}&z=${z}${this.langParam}`;
   }
 }
 
-// Метод для повторной попытки скачивания тайлов из лога
-async function retryFailedTiles() {
-  if (!fs.existsSync('failed_tiles.log')) {
-    console.log("No failed tiles log found.");
+// OpenStreetMap provider
+class OpenStreetMapTileProvider {
+  constructor () {
+    this.name = 'osm';
+  }
+
+  getTileUrl(x, y, z) {
+    return `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+  }
+}
+
+// Bing Maps provider
+class BingTileProvider {
+  constructor () {
+    this.name = 'bing';
+  }
+
+  getTileUrl(x, y, z) {
+    return `https://ecn.t${(x + y) % 4}.tiles.virtualearth.net/tiles/a${quadKey(x, y, z)}.png?g=1`;
+  }
+}
+
+// Convert x, y, z to Bing's quadkey format
+function quadKey(x, y, z) {
+  let key = '';
+  for (let i = z; i > 0; i--) {
+    let digit = 0;
+    const mask = 1 << (i - 1);
+    if ((x & mask) !== 0) digit += 1;
+    if ((y & mask) !== 0) digit += 2;
+    key += digit;
+  }
+  return key;
+}
+
+// Check if tile is within bounds
+function isTileInBounds(x, y, z, bounds) {
+  const n = Math.pow(2, z);
+  const lon_deg = x / n * 360.0 - 180.0;
+  const lat_rad = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
+  const lat_deg = lat_rad * 180.0 / Math.PI;
+
+  return lat_deg >= bounds.south && lat_deg <= bounds.north && lon_deg >= bounds.west && lon_deg <= bounds.east;
+}
+
+// Save tile to disk
+async function saveTile(tileUrl, x, y, z, provider) {
+  const outputDir = path.join('tiles', provider, z.toString(), x.toString());
+  const outputFile = path.join(outputDir, `${y}.png`);
+
+  if (fs.existsSync(outputFile)) {
+    console.log(`Tile already exists: ${outputFile}`);
     return;
   }
 
-  const failedTiles = fs.readFileSync('failed_tiles.log', 'utf-8').trim().split('\n');
-  const remainingFailedTiles = [];
+  try {
+    const response = await axios.get(tileUrl, { responseType: 'arraybuffer' });
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(outputFile, response.data);
+    console.log(`Saved tile: ${outputFile}`);
+    logToFile(`Saved tile: ${outputFile}`);
+  } catch (error) {
+    console.error(`Failed to save tile: ${tileUrl}`);
+    logToFile(`Failed to save tile: ${tileUrl}`);
+    throw error;
+  }
+}
 
-  for (const line of failedTiles) {
-    const [provider, z, x, y] = line.split(',');
-    const providerInstance = TileProviderFactory.create(provider);
-    const tileUrl = providerInstance.getTileUrl(x, y, z);
+// Parallel tile download
+async function downloadTilesParallel(providerInstance, z, bounds, lang, maxThreads = 6) {
+  const tilePromises = [];
+  let totalTiles = 0;
+  let completedTiles = 0;
 
-    try {
-      await saveTile(tileUrl, x, y, z, provider);
-    } catch (error) {
-      // Если снова не удалось скачать тайл, добавляем его в новый лог
-      remainingFailedTiles.push(line);
+  for (let x = 0; x < Math.pow(2, z); x++) {
+    for (let y = 0; y < Math.pow(2, z); y++) {
+      if (!bounds || isTileInBounds(x, y, z, bounds)) {
+        totalTiles++;
+      }
     }
   }
 
-  // Перезаписываем лог только оставшимися неудачными попытками
-  fs.writeFileSync('failed_tiles.log', remainingFailedTiles.join('\n'));
-  console.log("Retry of failed tiles complete.");
+  for (let x = 0; x < Math.pow(2, z); x++) {
+    for (let y = 0; y < Math.pow(2, z); y++) {
+      if (!bounds || isTileInBounds(x, y, z, bounds)) {
+        tilePromises.push(async () => {
+          const tileUrl = providerInstance.getTileUrl(x, y, z);
+          try {
+            await saveTile(tileUrl, x, y, z, providerInstance.name);
+            completedTiles++;
+            const progress = ((completedTiles / totalTiles) * 100).toFixed(2);
+            console.log(`Progress: ${progress}% (${completedTiles}/${totalTiles})`);
+            logToFile(`Progress: ${progress}% (${completedTiles}/${totalTiles})`);
+          } catch (error) {
+            fs.appendFileSync('failed_tiles.log', `${providerInstance.name},${z},${x},${y}\n`);
+          }
+        });
+
+        if (tilePromises.length === maxThreads) {
+          await Promise.all(tilePromises.map(promise => promise()));
+          tilePromises.length = 0;
+        }
+      }
+    }
+  }
+
+  if (tilePromises.length > 0) {
+    await Promise.all(tilePromises.map(promise => promise()));
+  }
 }
 
-// Пример вызова для скачивания тайлов Google и Yandex для Беларуси
-downloadTiles(12, 14, 'google', BOUNDS_MINSK);
-// downloadTiles(12, 17, 'yandex', BOUNDS_MINSK);
+// Download tiles for a range of zoom levels
+async function downloadZoomRange(provider, zoomStart, zoomEnd, bounds, lang = 'ru', maxThreads = 6) {
+  zoomEnd = zoomEnd || zoomStart;
 
-// Вызов для повторной попытки скачивания неудачных тайлов
-// retryFailedTiles();
+  for (let z = zoomStart; z <= zoomEnd; z++) {
+    console.log(`Starting download for zoom level ${z}...`);
+    logToFile(`Starting download for zoom level ${z}...`);
+    const providerInstance = TileProviderFactory.create(provider, lang);
+    await downloadTilesParallel(providerInstance, z, bounds, lang, maxThreads);
+    console.log(`Completed download for zoom level ${z}`);
+    logToFile(`Completed download for zoom level ${z}`);
+  }
+}
+
+// Main function
+(async function main() {
+  const provider = process.argv[2];
+  const zoomStart = parseInt(process.argv[3]);
+  const zoomEnd = parseInt(process.argv[4]) || zoomStart;
+  const bounds = process.argv[5] ? JSON.parse(process.argv[5]) : null;
+  const lang = process.argv[6] || 'ru';
+  const maxThreads = parseInt(process.argv[7]) || 6;
+
+  if (!provider || isNaN(zoomStart)) {
+    console.error('Usage: node index.js    [lang] [maxThreads]');
+    process.exit(1);
+  }
+
+  console.log(`Starting download for provider: ${provider}, Zoom range: ${zoomStart}-${zoomEnd}, Bounds: ${bounds ? JSON.stringify(bounds) : 'none'}, Lang: ${lang}, Max threads: ${maxThreads}`);
+  logToFile(`Starting download for provider: ${provider}, Zoom range: ${zoomStart}-${zoomEnd}, Bounds: ${bounds ? JSON.stringify(bounds) : 'none'}, Lang: ${lang}, Max threads: ${maxThreads}`);
+  await downloadZoomRange(provider, zoomStart, zoomEnd, bounds, lang, maxThreads);
+})();

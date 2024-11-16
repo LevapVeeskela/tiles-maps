@@ -11,10 +11,11 @@ const BOUNDS_MINSK = {
   west: 27.35,
   east: 27.75
 };
+const BOUNDS_BELARUS = { north: 56.2, south: 51.2, west: 23.2, east: 32.8 };
 
 const bounds = latLngBounds(
-  [BOUNDS_MINSK.south, BOUNDS_MINSK.west],
-  [BOUNDS_MINSK.north, BOUNDS_MINSK.east]
+  [BOUNDS_BELARUS.south, BOUNDS_BELARUS.west],
+  [BOUNDS_BELARUS.north, BOUNDS_BELARUS.east]
 );
 
 const generateMarkers = (count: number): LatLngExpression[] => {
@@ -30,7 +31,7 @@ const generateMarkers = (count: number): LatLngExpression[] => {
 const MapComponent = () => {
   const mapRef = useRef<LeafletMap | null>(null);
   const [mapType, setMapType] = useState<'google' | 'yandex'>('google');
-  const markers = useMemo(() => generateMarkers(1000000), []);
+  const markers = useMemo(() => generateMarkers(10000), []);
 
   const tileLayerUrls = useMemo(() => ({
     google: "http://localhost:3000/tiles/google/{z}/{x}/{y}.png",
@@ -41,8 +42,8 @@ const MapComponent = () => {
     mapRef.current = L.map('map', {
       center: [53.9, 27.6],
       zoom: 12,
-      minZoom: 12,
-      maxZoom: 14,
+      minZoom: 10,
+      maxZoom: 15,
       maxBounds: bounds,
       maxBoundsViscosity: 1.0,
     });
