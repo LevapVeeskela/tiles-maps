@@ -1,11 +1,159 @@
 const fs = require('fs');
 const path = require('path');
+const process = require('process');
+const dayjs = require('dayjs');
 const axios = require('axios');
 
-// Логирование в файл
-const logToFile = (message, logFile = 'download.log') => {
-  fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${message}\n`);
-};
+const FAILED_TILES_LOG = 'failed_tiles.log';
+const LOG_FOLDER = 'logs';
+const TILE_FOLDER = 'tiles';
+const MAX_LOG_LINES = 150000;
+
+if (!fs.existsSync(LOG_FOLDER)) {
+  fs.mkdirSync(LOG_FOLDER);
+}
+
+function getLogFileName() {
+  const date = dayjs().format('YYYY-MM-DD_HH-mm-ss');
+  return path.join(LOG_FOLDER, `log_${date}.log`);
+}
+
+let logFileName = getLogFileName();
+let logLines = 0;
+
+function logToFile(message) {
+  if (logLines >= MAX_LOG_LINES) {
+    logFileName = getLogFileName();
+    logLines = 0;
+  }
+  fs.appendFileSync(logFileName, `${new Date().toISOString()} - ${message}\n`);
+  logLines++;
+}
+
+function isTileInBounds(x, y, z, bounds) {
+  if (!bounds) return true;
+  const n = Math.pow(2, z);
+  const lon_deg = x / n * 360.0 - 180.0;
+  const lat_rad = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
+  const lat_deg = lat_rad * 180.0 / Math.PI;
+
+  return lat_deg >= bounds.south && lat_deg <= bounds.north && lon_deg >= bounds.west && lon_deg <= bounds.east;
+}
+
+async function saveTile(tileUrl, x, y, z, provider) {
+  const outputDir = path.join(TILE_FOLDER, provider, z.toString(), x.toString());
+  const outputFile = path.join(outputDir, `${y}.png`);
+
+  if (fs.existsSync(outputFile)) {
+    logToFile(`Tile already exists: ${outputFile}`);
+    console.log(`Tile already exists: ${outputFile}`);
+    return;
+  }
+
+  try {
+    const response = await axios.get(tileUrl, { responseType: 'arraybuffer' });
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(outputFile, response.data);
+    console.log(`Saved tile: ${outputFile}`);
+    logToFile(`Saved tile: ${outputFile}`);
+  } catch (error) {
+    console.error(`Failed to save tile: ${tileUrl}`);
+    logToFile(`Failed to save tile: ${tileUrl}`);
+    throw error;
+  }
+}
+
+async function downloadTilesForZoom(providerInstance, z, bounds, maxThreads, lang) {
+  const tilePromises = [];
+  let totalTiles = 0;
+  let completedTiles = 0;
+
+  // Count total tiles before download
+  for (let x = 0; x < Math.pow(2, z); x++) {
+    for (let y = 0; y < Math.pow(2, z); y++) {
+      if (!bounds || isTileInBounds(x, y, z, bounds)) {
+        totalTiles++;
+      }
+    }
+  }
+
+  logToFile(`Total tiles to download for zoom level ${z}: ${totalTiles}`);
+
+  // Main download loop
+  for (let x = 0; x < Math.pow(2, z); x++) {
+    for (let y = 0; y < Math.pow(2, z); y++) {
+      if (!bounds || isTileInBounds(x, y, z, bounds)) {
+        tilePromises.push(async () => {
+          const tileUrl = providerInstance.getTileUrl(x, y, z, lang);
+          try {
+            await saveTile(tileUrl, x, y, z, providerInstance.name, lang);
+            completedTiles++;
+            const progress = ((completedTiles / totalTiles) * 100).toFixed(2);
+            console.log(`Progress for zoom level ${z}: ${progress}% (${completedTiles}/${totalTiles})`);
+            logToFile(`Progress for zoom level ${z}: ${progress}% (${completedTiles}/${totalTiles})`);
+          } catch (error) {
+            fs.appendFileSync(FAILED_TILES_LOG, `${providerInstance.name},${z},${x},${y},${lang}\n`);
+            logToFile(`Failed tile: ${z},${x},${y},${lang}`);
+          }
+        });
+
+        if (tilePromises.length === maxThreads) {
+          await Promise.all(tilePromises.map(promise => promise()));
+          tilePromises.length = 0;
+        }
+      }
+    }
+  }
+
+  // Process remaining promises
+  if (tilePromises.length > 0) {
+    await Promise.all(tilePromises.map(promise => promise()));
+  }
+
+  logToFile(`All tiles downloaded for zoom level ${z}.`);
+}
+
+async function processFailedTiles(providerInstance, maxThreads) {
+  if (!fs.existsSync(FAILED_TILES_LOG)) return;
+
+  const failedTiles = fs.readFileSync(FAILED_TILES_LOG, 'utf-8').trim().split('\n');
+  if (failedTiles.length === 0) return;
+
+  const tilePromises = [];
+  let completedTiles = 0;
+  const totalTiles = failedTiles.length;
+
+  logToFile(`Retrying ${totalTiles} failed tiles.`);
+
+  for (const line of failedTiles) {
+    const [providerName, z, x, y, lang] = line.split(',');
+    tilePromises.push(async () => {
+      const tileUrl = providerInstance.getTileUrl(parseInt(x), parseInt(y), parseInt(z), lang);
+      try {
+        await saveTile(tileUrl, parseInt(x), parseInt(y), parseInt(z), providerName, lang);
+        completedTiles++;
+        const progress = ((completedTiles / totalTiles) * 100).toFixed(2);
+        console.log(`Retry Progress: ${progress}% (${completedTiles}/${totalTiles})`);
+        logToFile(`Retry Progress: ${progress}% (${completedTiles}/${totalTiles})`);
+      } catch (error) {
+        logToFile(`Failed tile again: ${z},${x},${y},${lang}`);
+      }
+    });
+
+    if (tilePromises.length === maxThreads) {
+      await Promise.all(tilePromises.map(promise => promise()));
+      tilePromises.length = 0;
+    }
+  }
+
+  // Process remaining failed tiles
+  if (tilePromises.length > 0) {
+    await Promise.all(tilePromises.map(promise => promise()));
+  }
+
+  fs.unlinkSync(FAILED_TILES_LOG); // Remove the file after processing
+  logToFile('Finished processing failed tiles.');
+}
 
 // Tile provider factory
 class TileProviderFactory {
@@ -15,9 +163,9 @@ class TileProviderFactory {
         return new GoogleTileProvider(lang);
       case 'yandex':
         return new YandexTileProvider(lang);
-      case 'osm': // OpenStreetMap
+      case 'osm':
         return new OpenStreetMapTileProvider();
-      case 'bing': // Bing Maps
+      case 'bing':
         return new BingTileProvider();
       default:
         throw new Error(`Provider "${providerName}" is not supported`);
@@ -84,111 +232,29 @@ function quadKey(x, y, z) {
   return key;
 }
 
-// Check if tile is within bounds
-function isTileInBounds(x, y, z, bounds) {
-  const n = Math.pow(2, z);
-  const lon_deg = x / n * 360.0 - 180.0;
-  const lat_rad = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
-  const lat_deg = lat_rad * 180.0 / Math.PI;
-
-  return lat_deg >= bounds.south && lat_deg <= bounds.north && lon_deg >= bounds.west && lon_deg <= bounds.east;
-}
-
-// Save tile to disk
-async function saveTile(tileUrl, x, y, z, provider) {
-  const outputDir = path.join('tiles', provider, z.toString(), x.toString());
-  const outputFile = path.join(outputDir, `${y}.png`);
-
-  if (fs.existsSync(outputFile)) {
-    console.log(`Tile already exists: ${outputFile}`);
-    return;
-  }
-
-  try {
-    const response = await axios.get(tileUrl, { responseType: 'arraybuffer' });
-    fs.mkdirSync(outputDir, { recursive: true });
-    fs.writeFileSync(outputFile, response.data);
-    console.log(`Saved tile: ${outputFile}`);
-    logToFile(`Saved tile: ${outputFile}`);
-  } catch (error) {
-    console.error(`Failed to save tile: ${tileUrl}`);
-    logToFile(`Failed to save tile: ${tileUrl}`);
-    throw error;
-  }
-}
-
-// Parallel tile download
-async function downloadTilesParallel(providerInstance, z, bounds, lang, maxThreads = 6) {
-  const tilePromises = [];
-  let totalTiles = 0;
-  let completedTiles = 0;
-
-  for (let x = 0; x < Math.pow(2, z); x++) {
-    for (let y = 0; y < Math.pow(2, z); y++) {
-      if (!bounds || isTileInBounds(x, y, z, bounds)) {
-        totalTiles++;
-      }
-    }
-  }
-
-  for (let x = 0; x < Math.pow(2, z); x++) {
-    for (let y = 0; y < Math.pow(2, z); y++) {
-      if (!bounds || isTileInBounds(x, y, z, bounds)) {
-        tilePromises.push(async () => {
-          const tileUrl = providerInstance.getTileUrl(x, y, z);
-          try {
-            await saveTile(tileUrl, x, y, z, providerInstance.name);
-            completedTiles++;
-            const progress = ((completedTiles / totalTiles) * 100).toFixed(2);
-            console.log(`Progress: ${progress}% (${completedTiles}/${totalTiles})`);
-            logToFile(`Progress: ${progress}% (${completedTiles}/${totalTiles})`);
-          } catch (error) {
-            fs.appendFileSync('failed_tiles.log', `${providerInstance.name},${z},${x},${y}\n`);
-          }
-        });
-
-        if (tilePromises.length === maxThreads) {
-          await Promise.all(tilePromises.map(promise => promise()));
-          tilePromises.length = 0;
-        }
-      }
-    }
-  }
-
-  if (tilePromises.length > 0) {
-    await Promise.all(tilePromises.map(promise => promise()));
-  }
-}
-
-// Download tiles for a range of zoom levels
-async function downloadZoomRange(provider, zoomStart, zoomEnd, bounds, lang = 'ru', maxThreads = 6) {
-  zoomEnd = zoomEnd || zoomStart;
-
-  for (let z = zoomStart; z <= zoomEnd; z++) {
-    console.log(`Starting download for zoom level ${z}...`);
-    logToFile(`Starting download for zoom level ${z}...`);
-    const providerInstance = TileProviderFactory.create(provider, lang);
-    await downloadTilesParallel(providerInstance, z, bounds, lang, maxThreads);
-    console.log(`Completed download for zoom level ${z}`);
-    logToFile(`Completed download for zoom level ${z}`);
-  }
-}
-
-// Main function
-(async function main() {
-  const provider = process.argv[2];
+async function main() {
+  const providerName = process.argv[2];
   const zoomStart = parseInt(process.argv[3]);
   const zoomEnd = parseInt(process.argv[4]) || zoomStart;
   const bounds = process.argv[5] ? JSON.parse(process.argv[5]) : null;
   const lang = process.argv[6] || 'ru';
   const maxThreads = parseInt(process.argv[7]) || 6;
 
-  if (!provider || isNaN(zoomStart)) {
-    console.error('Usage: node index.js    [lang] [maxThreads]');
-    process.exit(1);
+  const providerInstance = TileProviderFactory.create(providerName, lang);
+
+  await processFailedTiles(providerInstance, maxThreads);
+
+  for (let z = zoomStart; z <= zoomEnd; z++) {
+    console.log(`Starting download for zoom level ${z}...`);
+    logToFile(`Starting download for zoom level ${z}...`);
+    await downloadTilesForZoom(providerInstance, z, bounds, maxThreads, lang);
+    console.log(`Completed download for zoom level ${z}`);
+    logToFile(`Completed download for zoom level ${z}`);
   }
 
-  console.log(`Starting download for provider: ${provider}, Zoom range: ${zoomStart}-${zoomEnd}, Bounds: ${bounds ? JSON.stringify(bounds) : 'none'}, Lang: ${lang}, Max threads: ${maxThreads}`);
-  logToFile(`Starting download for provider: ${provider}, Zoom range: ${zoomStart}-${zoomEnd}, Bounds: ${bounds ? JSON.stringify(bounds) : 'none'}, Lang: ${lang}, Max threads: ${maxThreads}`);
-  await downloadZoomRange(provider, zoomStart, zoomEnd, bounds, lang, maxThreads);
-})();
+  await processFailedTiles(providerInstance, maxThreads);
+}
+
+main().catch(err => {
+  console.error('An error occurred:', err);
+});
