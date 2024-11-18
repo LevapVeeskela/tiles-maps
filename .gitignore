@@ -23,5 +23,6 @@ yarn-debug.log*
 yarn-error.log*
 
 /tiles*
+/logs/*
 download.log
 failed_tiles.log
